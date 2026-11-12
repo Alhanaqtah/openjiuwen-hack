@@ -54,6 +54,7 @@ STRONG = os.environ.get("MODEL_STRONG", "qwen3.6-35b-a3b-noreason")  # second op
 REASON = os.environ.get("MODEL_REASON", "qwen3.8-27b")  # tie-breaker only (reasoning tokens are expensive)
 VERIFY = os.environ.get("VERIFY", "1") == "1"  # phase 2: second opinion on answered tasks while budget remains
 VERIFY_KEEP = float(os.environ.get("VERIFY_KEEP", "0.5"))  # share of budget never spent on verification
+VERIFY_TOP = float(os.environ.get("VERIFY_TOP", "0.5"))  # verify only this top share of answered tasks by reward
 PRECHECK = os.environ.get("PRECHECK", "0") == "1"  # gate every compute task (hurts recall; off)
 ZERO_GUARD = os.environ.get("ZERO_GUARD", "1") == "1"  # re-check tasks whose computed answer is 0
 PARALLEL = int(os.environ.get("PARALLEL", "4"))
@@ -245,13 +246,43 @@ for _r, _d, _fs in os.walk(_ROOT):
             kb[_p] = open(os.path.join(_ROOT, _p), encoding="utf-8", errors="replace").read()
         except OSError:
             pass
+class _Missing(str):
+    """stands for an absent record/field: any lookup returns itself, it is falsy, behaves as an empty string
+    in regexes and prints as UNSOLVABLE"""
+    def __new__(cls): return str.__new__(cls, "")
+    def __getitem__(self, k): return self
+    def get(self, k, d=None): return self
+    def __getattr__(self, k): return self
+    def __call__(self, *a, **k): return self
+    def __bool__(self): return False
+    def __iter__(self): return iter(())
+    def __len__(self): return 0
+    def __eq__(self, o): return isinstance(o, _Missing)
+    def __hash__(self): return 0
+    def __str__(self): return "UNSOLVABLE"
+    def __format__(self, spec): return "UNSOLVABLE"
+    __repr__ = __str__
+    def lower(self): return self
+    def strip(self, *a): return self
+MISSING = _Missing()
+_SMALL = r"(?:\s+(?:by|in|at|on|of|is|was|are|were|the|a|an|to|for|from|as|:|-|=))*"
+class Rec(dict):
+    """record whose missing fields fall back to a keyword search in its own text: 'born' finds 'born in 1990',
+    'headquarters' finds 'headquartered in Riga', 'mentor' finds 'mentored by Ann Lee'"""
+    def __missing__(self, k):
+        text = dict.get(self, "_text", "")
+        stem = re.escape(str(k).strip().lower()[:5])
+        if not text or not stem or str(k).startswith("_"): return MISSING
+        m = re.search(r"\b" + stem + r"\w*" + _SMALL + r"\s+(\d[\d.,/-]*|[A-Z][\w'&.-]*(?:\s+(?:[A-Z][\w'&.-]*|of|and|the|&))*)", text)
+        return m.group(1).rstrip(".,;") if m else MISSING
+    def get(self, k, d=None): return self[k] if k in self else (MISSING if d is None else d)
 records = {}
 _FIELD = re.compile(r"^\s*(?:[-*+]\s*)?\**([A-Za-z][\w /().'-]{0,40}?)\**\s*:\s*\**(.+?)\**\s*$", re.M)
 def _put(title, fields, path, text):
     t = str(title).strip().strip("#").strip()
     if not t: return
     key = t if t not in records else f"{t} ({path})"
-    records[key] = {**{str(k).strip().lower(): v for k, v in fields.items()}, "_file": path, "_text": text.strip()}
+    records[key] = Rec({**{str(k).strip().lower(): v for k, v in fields.items()}, "_file": path, "_text": text.strip()})
 def _walk_json(obj, path):
     if isinstance(obj, dict):
         for nk in ("name", "title", "full_name", "id", "person", "company", "label"):
@@ -290,9 +321,9 @@ def _starts(n):
 def rec(name):
     """record by title (case-insensitive exact), else the unique record whose text starts with / mentions the name;
     a too-long name (greedy capture) is shortened word by word until a title matches"""
-    if name is None: return None
+    if name is None or isinstance(name, _Missing): return MISSING
     n = re.sub(r"\s+", " ", str(name).strip().strip(".,;:")).lower()
-    if not n: return None
+    if not n: return MISSING
     words = n.split()
     prefixes = [" ".join(words[:k]) for k in range(len(words), 1, -1)] or [n]
     for f in (_title, _starts):
@@ -300,9 +331,10 @@ def rec(name):
             r = f(pref)
             if r: return r
     hits = [v for v in records.values() if n in v["_text"].lower()]
-    return hits[0] if len(hits) == 1 else None
+    return hits[0] if len(hits) == 1 else MISSING
 def facts(name):
     """sentences from any file that mention the name (for free-text notes)"""
+    if isinstance(name, _Missing): return []
     n = str(name).strip().lower()
     return [s.strip() for t in kb.values() for s in re.split(r"(?<=[.!?])\s+|\n", t) if n in s.lower()]
 def grep(pattern):
@@ -312,13 +344,48 @@ def grep(pattern):
 '''
 
 
+_KB_CACHE: dict[str, dict] = {}
+
+
+def kb_env(ws: Path) -> dict:
+    """The prelude executed in-process for this workspace (records, rec, ...), cached per task."""
+    key = str(ws)
+    if key not in _KB_CACHE:
+        g: dict = {"_ROOT": key}
+        try:
+            exec(KB_PRELUDE, g)
+        except Exception as e:
+            g = {"records": {}, "error": str(e)}
+        _KB_CACHE[key] = g
+    return _KB_CACHE[key]
+
+
+PLACE_Q = re.compile(r"\b(where|which city|what city|in which city|in what city|which town|which country|located)\b", re.I)
+PLACE_FIELDS = ("headquarters", "hq", "city", "location", "located", "based", "town", "country", "office", "address")
+
+
+def refine_answer(question: str, ans: str, ws: Path) -> str:
+    """One hop short is a common model slip: 'where is X's employer' answered with the employer's name.
+    If the answer is itself a record title and the question asks for a place, take the record's place field."""
+    if not PLACE_Q.search(question):
+        return ans
+    g = kb_env(ws)
+    r = g["records"].get(ans) or next((v for k, v in g["records"].items() if k.lower() == ans.lower()), None)
+    if not r:
+        return ans
+    for f in PLACE_FIELDS:
+        v = r[f]  # Rec: exact field, else keyword fallback in the record text, else MISSING (empty)
+        if isinstance(v, str) and v:
+            log.info("refine: %r -> %r via field %s", ans, v, f)
+            return v
+    return ans
+
+
 def kb_summary(ws: Path) -> str:
-    """Run the same parser the task code will see, and describe what it produced (record count, field names)."""
-    g: dict = {"_ROOT": str(ws)}
-    try:
-        exec(KB_PRELUDE, g)
-    except Exception as e:
-        return f"(kb parse failed: {e})"
+    """Describe what the parser produced for this knowledge base (record count, field names)."""
+    g = kb_env(ws)
+    if "error" in g:
+        return f"(kb parse failed: {g['error']})"
     recs = g["records"]
     fields = collections.Counter(k for r in recs.values() for k in r if not k.startswith("_"))
     if not recs:
@@ -330,6 +397,12 @@ def kb_summary(ws: Path) -> str:
     titles = list(recs)[:3]
     return (f"records: {len(recs)} entries, e.g. titles {titles}; fields seen: {sample}. "
             "Use exactly these field names; a fact that is not a field may still be in rec(name)['_text'].")
+
+
+def same_answer(a: str | None, b: str | None) -> bool:
+    if a is None or b is None:
+        return a is b
+    return normalize_number(a).lower().strip() == normalize_number(b).lower().strip()
 
 
 def run_python(code: str, cwd: Path, timeout: int = 30, prelude: str = "") -> tuple[int, str, str]:
@@ -360,8 +433,28 @@ def check_line_says_unsolvable(reply: str) -> bool:
     if not m:
         return False
     line = m.group(1)
-    return bool(re.search(r"\b(not given|not specified|not provided|not present|not available|unspecified|missing|absent|unknown|no such|does not exist|cannot|unsolvable)\b", line, re.I)) \
+    if re.match(r"\s*OK\b", line, re.I):
+        return False
+    return bool(re.search(r"\b(missing|not given|not specified|not provided|not present|not available|unspecified|absent|unknown|no such|does not exist|cannot|unsolvable)\b", line, re.I)) \
         and not re.search(r"\b(all (?:are |quantities are )?(?:given|present|provided|specified)|nothing (?:is )?missing|none missing)\b", line, re.I)
+
+
+NUMERIC_Q = re.compile(r"\b(how many|how much|how old|how far|how long|what (?:is|was|were) the (?:total|number|count|sum|average|mean|maximum|minimum|highest|lowest|balance|revenue|value|age)|(?:in |during )?(?:what|which) year|birth year|year of birth|year (?:was|did|when|were)|founded|what age|age of|what number|what percentage)\b", re.I)
+TEXT_Q = re.compile(r"\b(which|what|in what)\s+(city|town|country|company|organi[sz]ation|employer|region|team|department|name|product|station|colou?r|language)\b|\b(where|whose|whom)\b|^\W*who\b", re.I)
+
+
+def answer_type_ok(question: str, ans: str) -> bool:
+    """Reject answers whose shape contradicts the question (a year for 'which city', a name for 'how many',
+    a raw 'Key: value' line): the usual symptom of printing a related fact instead of the one asked for."""
+    a = ans.strip()
+    is_num = bool(re.fullmatch(r"-?[\d,]+(?:\.\d+)?", a))
+    if re.fullmatch(r"[A-Za-z_ ]{2,30}:\s*\S.*", a):
+        return False
+    if TEXT_Q.search(question) and not NUMERIC_Q.search(question) and is_num:
+        return False
+    if NUMERIC_Q.search(question) and not TEXT_Q.search(question) and not is_num and not re.search(r"\d", a):
+        return False
+    return True
 
 
 def clean_answer(out: str) -> str:
@@ -434,15 +527,14 @@ def estimate(task: Task) -> float:
 # ---------------------------------------------------------------- solvers
 
 SYS_COMPUTE = (
-    "You solve quantitative tasks by writing a short Python 3 program (stdlib only; csv module for CSV files). "
-    "The program runs in the task directory and must print ONLY the final answer on the last line. "
-    "Rules: follow the wording literally and in order (inclusive ranges; 'added'/'received' means +, 'charged'/"
-    "'shipped' means -; 'rounded down' means // or int()); keep integer arithmetic for whole items; "
-    "use only columns/fields that actually exist, never reinterpret a column as a different quantity "
-    "(years of experience are not age, salary is not bonus, units are not returns). "
-    f"If a needed quantity, column or value is missing or unspecified, the program must print {UNSOLVABLE} "
-    "instead of guessing or assuming 0. Reply format: first a single line 'CHECK: <which quantities the "
-    "question needs and whether each is given>' then one ```python block with short code, no comments."
+    "Solve the task by writing a short Python 3 program (stdlib only; csv/json for data files) that runs in the "
+    "task directory and prints ONLY the final answer on the last line. Follow the wording literally and in order "
+    "(inclusive ranges; 'added'/'received' +, 'charged'/'shipped' -; 'rounded down' = //); integer arithmetic for "
+    "whole items; use only columns/fields that exist, never reinterpret one as another quantity (years of "
+    f"experience are not age, salary is not bonus, units are not returns). If a needed number, column or value is "
+    f"missing or unspecified, print {UNSOLVABLE} instead of guessing or assuming 0.\n"
+    "Reply format: first line 'CHECK: OK' or 'CHECK: MISSING <what>', then one ```python block, as few lines as "
+    "possible, no comments."
 )
 
 
@@ -486,6 +578,9 @@ async def solve_compute(task: Task, llm: LLM, models=None) -> str | None:
             if is_unsolvable(ans):
                 return None
             ans = normalize_number(ans)
+            if not answer_type_ok(instr, ans):
+                task.trace.append({"rejected": ans})
+                return None
             # a zero count/sum is the typical symptom of a question about data that is not there
             if ZERO_GUARD and task.type == "data_analysis" and ans in ("0", "0.0") \
                     and not await precheck(task, llm, instr, preview[:600], model=STRONG):
@@ -530,13 +625,13 @@ async def solve_search(task: Task, llm: LLM, models=None) -> str | None:
 
 
 SYS_CODE = (
-    "You fix bugs in Python source files so that the project's tests pass. The grader runs HIDDEN tests that are "
-    "broader than the visible ones (empty inputs, single elements, negatives, duplicates, mixed case, boundaries), "
-    "so review EVERY function/method, not only the failing ones, and make each behave as its name and docstring "
-    "imply. Never touch the tests. Reply with ONE or more ```python blocks containing ONLY corrected top-level "
-    "functions/classes (complete definitions; a changed method means the whole class). When there are several "
-    "source files, start each block with a comment line '# file: <path>'. Already-correct code may be omitted. "
-    f"No prose, no shell commands. If two tests demand contradictory results for the same input, reply {UNSOLVABLE}."
+    "Fix bugs in Python source files so the project's tests pass. The grader runs HIDDEN tests broader than the "
+    "visible ones (empty inputs, single elements, negatives, duplicates, mixed case, boundaries), so review EVERY "
+    "function/method, not only the failing ones, and make each behave as its name and docstring imply. Never touch "
+    "the tests. Reply with ```python blocks containing ONLY corrected top-level functions/classes (complete "
+    "definitions; a changed method means the whole class); with several source files start each block with "
+    "'# file: <path>'. Omit code that is already correct. No prose, no shell commands. If two tests demand "
+    f"contradictory results for the same input, reply {UNSOLVABLE}."
 )
 
 
@@ -572,6 +667,16 @@ def test_command(test_file: Path, ws: Path) -> list[str]:
     if "unittest" in src:
         return [sys.executable, "-m", "unittest", "-q", rel]
     return [sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", rel]
+
+
+def summarize_test_output(out: str, limit: int = 1600) -> str:
+    """Keep the informative lines of a unittest/pytest report (failing test names, assertion lines, errors)."""
+    keep = []
+    for ln in out.splitlines():
+        if re.match(r"\s*(FAIL|ERROR|FAILED|PASSED|Ran \d|E\s|>\s|\w*Error\b|\w*Exception\b|assert\b|\s+self\.assert|\s+File .*test|={3,}|_{3,}|\d+ (passed|failed))", ln):
+            keep.append(ln.rstrip()[:200])
+    text = "\n".join(keep) if keep else out
+    return text[-limit:]
 
 
 def run_tests(task: Task, cmd: list[str]) -> tuple[bool, str]:
@@ -660,13 +765,13 @@ async def solve_coding(task: Task, llm: LLM, models=None) -> str | None:
     instr = strip_boilerplate(task.instruction)
     shown_src = "".join(f"### {p.relative_to(task.ws)}\n```python\n{originals[p]}\n```\n\n" for p in srcs)[:14000]
     shown_tests = "".join(f"### {t.relative_to(task.ws)}\n```python\n{read(t, 6000)}\n```\n\n" for t in tests)[:10000]
-    user = (f"Task: {instr}\n\n{shown_src}{shown_tests}### test output of `{' '.join(cmd[1:] if cmd[0] == sys.executable else cmd)}`\n```\n{out[-2500:]}\n```\n\n"
+    user = (f"Task: {instr}\n\n{shown_src}{shown_tests}### test output of `{' '.join(cmd[1:] if cmd[0] == sys.executable else cmd)}`\n```\n{summarize_test_output(out)}\n```\n\n"
             "Note: a function whose visible test passes can still be wrong (e.g. the test input happens to "
             "work). Check each function's logic against its name and include a fixed version of every "
             "function that is incorrect.")
     msgs = [{"role": "system", "content": SYS_CODE}, {"role": "user", "content": user}]
-    attempts = list(models) + [models[0]]  # one extra attempt for a prose-only / unparsable reply
-    for attempt, model in enumerate(attempts[:3]):
+    attempts = list(models)
+    for attempt, model in enumerate(attempts):
         reply = await llm.ask(msgs, model=model, max_tokens=1500 if "noreason" in model else 3000,
                               tag=f"{task.id}#{attempt}")
         if is_unsolvable(reply) and "```" not in reply:
@@ -674,6 +779,8 @@ async def solve_coding(task: Task, llm: LLM, models=None) -> str | None:
             break
         if "```" not in reply and "def " not in reply:
             task.trace.append({"reply": reply[:300]})
+            if len(attempts) < 3:
+                attempts.append(model)  # one extra attempt only for a prose-only reply
             msgs += [{"role": "assistant", "content": reply},
                      {"role": "user", "content": "You cannot explore or run commands. Reply now with the corrected code only, in ```python blocks."}]
             continue
@@ -692,28 +799,24 @@ async def solve_coding(task: Task, llm: LLM, models=None) -> str | None:
         if ok:
             return "DONE"
         msgs += [{"role": "assistant", "content": reply},
-                 {"role": "user", "content": f"Tests still fail:\n```\n{out[-2000:]}\n```\nReply with the corrected code again."}]
+                 {"role": "user", "content": f"Tests still fail:\n```\n{summarize_test_output(out, 1200)}\n```\nIf the failing assertion contradicts "
+                                             f"another test or the function's evident purpose, reply {UNSOLVABLE}; otherwise reply with the corrected code again."}]
     for p, src in originals.items():
         p.write_text(src)
     return None
 
 
 SYS_KB = (
-    "You answer a question about a small knowledge base of files by writing a SHORT Python 3 snippet (<= ~15 "
-    "lines). Predefined variables (do not redefine, do not write files):\n"
-    "  kb: dict path -> full text of every file under the current directory;\n"
-    "  records: dict title -> {field: value} parsed from headings/sections, 'Key: value' lines and JSON objects; "
-    "every record also has '_file' and '_text' (its raw text);\n"
-    "  rec(name): record by title (case-insensitive exact match), else the unique record whose text starts with or "
-    "mentions the name; None if absent;\n"
-    "  grep(regex): [(path, line)] over all files, case-insensitive; facts(name): sentences mentioning a name.\n"
-    "When extracting a value from a sentence, capture lazily up to a delimiter, e.g. r'works at (.+?)(?= as | and |[.,;])'.\n"
-    "Follow references between records when needed (person -> mentor/employer -> organisation). Match names "
-    "exactly; a similar name is a different entity. Use only field names that the summary/sample show exist; "
-    "for free-text notes extract values with regular expressions. Print ONLY the final answer on the last line "
-    f"(bare year, city, name or number). If the entity or the specific fact asked for is absent, print {UNSOLVABLE} "
-    "instead of guessing or printing a related value. Reply format: one line 'CHECK: <what is needed>' then one "
-    "```python block, short code, no comments."
+    "Answer a question about a knowledge base of files with a SHORT Python 3 snippet. Predefined (do not redefine, "
+    "do not write files): kb {path: text}; records {title: {field: value}} parsed from headings/sections, "
+    "'Key: value' lines and JSON objects (each also has '_file', '_text'); rec(name) -> record by title or the unique "
+    "record whose text starts with/mentions the name; grep(regex) -> [(path, line)]; facts(name) -> sentences "
+    "mentioning the name. rec() and ['field'] never raise: anything absent is MISSING and prints as UNSOLVABLE, so "
+    "chain lookups without if/else, e.g. print(rec(rec('Ann Lee')['mentor'])['born']). Pass full names exactly as "
+    "in the question; use only field names shown in the summary; a similar name is a different entity; in free text "
+    "capture lazily, e.g. r'works at (.+?)(?= as | and |[.,;])'. Print ONLY the final answer (bare year/city/name/"
+    f"number) on the last line, or {UNSOLVABLE} if the entity or the exact attribute asked for is absent (a birth "
+    "city is not a birth year; never print '_text' or another field). One ```python block, 1-6 lines, no comments."
 )
 
 
@@ -725,9 +828,10 @@ def kb_preview(ws: Path, question: str, limit: int = 2600) -> str:
         key = (p.parent, re.split(r"[_\-.]", p.name)[0])
         if key not in seen:
             seen.add(key); picked.append(p)
-    for p in files:  # then files named after entities in the question
-        if any(w in str(p.relative_to(ws)).lower() for w in words) and p not in picked:
-            picked.append(p)
+    ent = 0
+    for p in files:  # then up to two files named after entities in the question
+        if any(w in str(p.relative_to(ws)).lower() for w in words) and p not in picked and ent < 2:
+            picked.append(p); ent += 1
     parts, used = [], 0
     for p in picked[:5]:
         chunk = f"### {p.relative_to(ws)}\n{read(p, 700).strip()}"
@@ -755,7 +859,21 @@ async def solve_search_code(task: Task, llm: LLM, models=None) -> str | None:
         ans = clean_answer(out).strip(" .`*\"'")
         task.trace.append({"code": code, "rc": rc, "out": out[-300:], "err": err[-300:], "truncated": truncated})
         if rc == 0 and ans and not truncated:
-            return None if is_unsolvable(ans) or len(ans) > 80 else ans
+            if is_unsolvable(ans):
+                return None
+            if len(ans) > 80:  # a whole record was printed: accept only if the question wants a number and the text has exactly one
+                nums = re.findall(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?(?![\w.])", ans)
+                if NUMERIC_Q.search(instr) and len(nums) == 1:
+                    task.trace.append({"extracted": nums[0], "from": ans[:120]})
+                    ans = nums[0]
+                else:
+                    task.trace.append({"rejected": ans[:120]})
+                    return None
+            ans = refine_answer(instr, ans, task.ws)
+            if not answer_type_ok(instr, ans):
+                task.trace.append({"rejected": ans})
+                return None
+            return ans
         if truncated:
             max_tokens = 900
             msgs += [{"role": "assistant", "content": reply},
@@ -849,37 +967,40 @@ async def run(tasks: list[Task], ledger: Ledger, deadline: float, traces_out: Pa
 
 
 async def verify_phase(tasks, ledger: Ledger, deadline: float, sem: asyncio.Semaphore, traces_out):
-    """Spend leftover budget on a second opinion from the reasoning model for answered tasks, highest reward
-    first. Disagreement -> third vote (other fast model); majority wins; without a majority the reasoning
-    answer is kept. A None from a verifier is an abstention: verification never removes an answer."""
+    """Spend leftover budget on a cheap second opinion (the other fast model) for the highest-reward answered
+    tasks. Agreement ends it; disagreement is settled by the reasoning model: majority wins, otherwise the
+    reasoning answer. A None from a verifier is an abstention: verification never removes an answer."""
     cands = sorted((t for t in tasks if t.status == "answered" and t.type != "coding"),
                    key=lambda t: -t.reward)
+    cands = cands[: max(1, int(round(len(cands) * VERIFY_TOP)))]
     floor = ledger.budget * VERIFY_KEEP
 
     async def check(t: Task):
         async with sem:
-            if time.time() > deadline - 120 or ledger.free - 900 < floor:
+            if time.time() > deadline - 120 or ledger.free - 400 < floor:
                 return
             solver = SOLVERS.get(t.type, solve_compute)
             trace: list = []
             llm = LLM(ledger, trace)
             verdict, final, a2 = "abstain", t.answer, None
             try:
-                a2 = await asyncio.wait_for(solver(t, llm, models=(REASON,)), timeout=max(10, deadline - time.time()))
+                a2 = await asyncio.wait_for(solver(t, llm, models=(STRONG,)), timeout=max(10, deadline - time.time()))
                 if a2 is None:
                     verdict = "abstain"
                 elif same_answer(a2, t.answer):
                     verdict = "agree"
-                elif ledger.free - 400 < floor:
+                elif ledger.free - 1500 < floor:
                     verdict = "disagree:unresolved"
                 else:
-                    a3 = await asyncio.wait_for(solver(t, llm, models=(STRONG,)), timeout=max(10, deadline - time.time()))
-                    if same_answer(a3, t.answer):
+                    a3 = await asyncio.wait_for(solver(t, llm, models=(REASON,)), timeout=max(10, deadline - time.time()))
+                    if a3 is None:
+                        verdict = "disagree:abstain"
+                    elif same_answer(a3, t.answer):
                         verdict = "majority:first"
                     elif same_answer(a3, a2):
-                        verdict, final = "majority:reason", a2
+                        verdict, final = "majority:second", a2
                     else:
-                        verdict, final = "reason", a2
+                        verdict, final = "reason", a3
                 if final != t.answer:
                     write_answer(t, final)
                     t.answer = final
@@ -887,6 +1008,7 @@ async def verify_phase(tasks, ledger: Ledger, deadline: float, sem: asyncio.Sema
                 verdict = "skipped:budget"
             except Exception as e:
                 verdict = f"error:{type(e).__name__}"
+                trace.append({"error": repr(e)[:300]})
             finally:
                 trace.append({"verify": verdict, "a2": a2})
                 spent = sum(x.get("cost", 0) for x in trace if "cost" in x)
