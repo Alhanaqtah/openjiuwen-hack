@@ -32,7 +32,7 @@ for d in sorted(root.iterdir()):
     elif chk == "unittest":
         ws = d / "workspace"
         hidden = d / "hidden_tests.py"
-        tests = next(ws.glob("test*.py"))
+        tests = next((q for q in ws.rglob("*.py") if q.name.startswith("test") or q.stem.endswith("_test")), None)
         def cmd(tf):
             src = tf.read_text()
             if "unittest.main" in src:

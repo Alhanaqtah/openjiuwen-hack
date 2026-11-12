@@ -6,10 +6,12 @@ env: LLM_BASE_URL, LLM_API_KEY, BUDGET (output-token equivalents; input counts 1
 import argparse
 import ast
 import asyncio
+import collections
 import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -231,49 +233,103 @@ def write_answer(task: Task, answer: str):
 
 KB_PRELUDE = r'''
 import os, re, sys, json, csv, collections, itertools, math
+_ROOT = globals().get("_ROOT", ".")
 kb = {}
-for _root, _dirs, _files in os.walk("."):
-    for _f in sorted(_files):
-        _p = os.path.join(_root, _f)[2:]
-        if _f.startswith(".") or _f in ("task.json", "answer.txt") or os.path.getsize(_p) > 2_000_000:
+for _r, _d, _fs in os.walk(_ROOT):
+    _d[:] = [x for x in _d if not x.startswith(".") and x != "__pycache__"]
+    for _f in sorted(_fs):
+        _p = os.path.relpath(os.path.join(_r, _f), _ROOT)
+        if _f.startswith(".") or _f in ("task.json", "answer.txt") or os.path.getsize(os.path.join(_ROOT, _p)) > 2_000_000:
             continue
         try:
-            kb[_p] = open(_p, encoding="utf-8", errors="replace").read()
+            kb[_p] = open(os.path.join(_ROOT, _p), encoding="utf-8", errors="replace").read()
         except OSError:
             pass
 records = {}
+_FIELD = re.compile(r"^\s*(?:[-*+]\s*)?\**([A-Za-z][\w /().'-]{0,40}?)\**\s*:\s*\**(.+?)\**\s*$", re.M)
+def _put(title, fields, path, text):
+    t = str(title).strip().strip("#").strip()
+    if not t: return
+    key = t if t not in records else f"{t} ({path})"
+    records[key] = {**{str(k).strip().lower(): v for k, v in fields.items()}, "_file": path, "_text": text.strip()}
+def _walk_json(obj, path):
+    if isinstance(obj, dict):
+        for nk in ("name", "title", "full_name", "id", "person", "company", "label"):
+            if nk in obj and isinstance(obj[nk], (str, int)):
+                _put(obj[nk], {k: v for k, v in obj.items() if not isinstance(v, (dict, list))}, path, json.dumps(obj, ensure_ascii=False))
+                break
+        for v in obj.values():
+            _walk_json(v, path)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_json(v, path)
 for _p, _t in kb.items():
-    _m = re.search(r"^#\s*(.+?)\s*$", _t, re.M)
-    _title = _m.group(1).strip() if _m else os.path.splitext(os.path.basename(_p))[0]
-    _fields = {}
-    for _k, _v in re.findall(r"^\**([A-Za-z][A-Za-z0-9 _/-]{0,40}?)\**\s*:\s*(.+?)\s*$", _t, re.M):
-        _fields.setdefault(_k.strip().lower(), _v.strip())
-    _fields["_file"] = _p
-    records[_title] = _fields
+    if _p.endswith((".json", ".jsonl")):
+        try:
+            _walk_json(json.loads(_t) if _p.endswith(".json") else [json.loads(l) for l in _t.splitlines() if l.strip()], _p)
+            continue
+        except ValueError:
+            pass
+    _secs = re.split(r"(?m)^(?=#{1,6}\s)", _t)
+    _any = False
+    for _sec in _secs:
+        _m = re.match(r"#{1,6}\s*(.+)", _sec)
+        _fields = {k: v for k, v in _FIELD.findall(_sec)}
+        if _m or _fields:
+            _any = True
+            _put(_m.group(1) if _m else os.path.splitext(os.path.basename(_p))[0].replace("_", " ").replace("-", " "), _fields, _p, _sec)
+    if not _any and _t.strip():  # free text: one record per file, titled by the leading proper name or the file name
+        _lead = re.match(r"\s*([A-Z][\w'-]+(?:\s+[A-Z][\w'&.-]+){0,3})", _t)
+        _put(_lead.group(1) if _lead else os.path.splitext(os.path.basename(_p))[0].replace("_", " ").replace("-", " "), {}, _p, _t)
+def _title(n):
+    for k, v in records.items():
+        if k.lower() == n or k.lower().startswith(n + " ("): return v
+def _starts(n):
+    hits = [v for v in records.values() if v["_text"].lower().lstrip("#*- ").startswith(n)]
+    return hits[0] if len(hits) == 1 else None
 def rec(name):
-    """record by title, case-insensitive exact match; None if absent"""
+    """record by title (case-insensitive exact), else the unique record whose text starts with / mentions the name;
+    a too-long name (greedy capture) is shortened word by word until a title matches"""
     if name is None: return None
+    n = re.sub(r"\s+", " ", str(name).strip().strip(".,;:")).lower()
+    if not n: return None
+    words = n.split()
+    prefixes = [" ".join(words[:k]) for k in range(len(words), 1, -1)] or [n]
+    for f in (_title, _starts):
+        for pref in prefixes:
+            r = f(pref)
+            if r: return r
+    hits = [v for v in records.values() if n in v["_text"].lower()]
+    return hits[0] if len(hits) == 1 else None
+def facts(name):
+    """sentences from any file that mention the name (for free-text notes)"""
     n = str(name).strip().lower()
-    for _k, _v in records.items():
-        if _k.lower() == n: return _v
-    return None
+    return [s.strip() for t in kb.values() for s in re.split(r"(?<=[.!?])\s+|\n", t) if n in s.lower()]
+def grep(pattern):
+    """[(path, line)] for lines matching the regex (case-insensitive) in any file"""
+    rx = re.compile(pattern, re.I)
+    return [(p, ln) for p, t in kb.items() for ln in t.splitlines() if rx.search(ln)]
 '''
 
 
-def remove_answer(task: Task):
-    for target in (task.dir / "answer.txt", task.ws / "answer.txt"):
-        try:
-            target.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            log.warning("%s: cannot remove %s: %s", task.id, target, e)
-
-
-def same_answer(a: str | None, b: str | None) -> bool:
-    if a is None or b is None:
-        return a is b
-    return normalize_number(a).lower().strip() == normalize_number(b).lower().strip()
+def kb_summary(ws: Path) -> str:
+    """Run the same parser the task code will see, and describe what it produced (record count, field names)."""
+    g: dict = {"_ROOT": str(ws)}
+    try:
+        exec(KB_PRELUDE, g)
+    except Exception as e:
+        return f"(kb parse failed: {e})"
+    recs = g["records"]
+    fields = collections.Counter(k for r in recs.values() for k in r if not k.startswith("_"))
+    if not recs:
+        return "records is EMPTY: no files found."
+    if not fields:
+        return (f"records: {len(recs)} entries titled by file name, with NO key:value fields (free-text notes). "
+                "Facts are inside sentences: use grep(regex) / rec(name)['_text'] with regular expressions.")
+    sample = ", ".join(f"{k}({n})" for k, n in fields.most_common(14))
+    titles = list(recs)[:3]
+    return (f"records: {len(recs)} entries, e.g. titles {titles}; fields seen: {sample}. "
+            "Use exactly these field names; a fact that is not a field may still be in rec(name)['_text'].")
 
 
 def run_python(code: str, cwd: Path, timeout: int = 30, prelude: str = "") -> tuple[int, str, str]:
@@ -361,7 +417,7 @@ def prompt_chars(task: Task) -> int:
     if task.type == "search":
         return len(SYS_KB) + len(instr) + len(kb_preview(task.ws, instr))
     if task.type == "coding":
-        py = sum(p.stat().st_size for p in ws_files(task.ws) if p.suffix == ".py")
+        py = min(24000, sum(p.stat().st_size for p in ws_files(task.ws) if p.suffix == ".py"))
         return len(SYS_CODE) + len(instr) + py + 1200  # + failing test output
     return len(SYS_COMPUTE) + len(instr) + len(file_preview(task.ws))
 
@@ -474,31 +530,57 @@ async def solve_search(task: Task, llm: LLM, models=None) -> str | None:
 
 
 SYS_CODE = (
-    "You fix bugs in a Python module so that its unit tests pass. The grader runs HIDDEN tests that are broader "
-    "than the visible ones (empty inputs, single elements, negatives, duplicates, mixed case, boundaries), so "
-    "review EVERY function, not only the failing ones, and make each behave as its name and docstring imply. "
-    "Never touch the tests. Reply with ONE ```python block containing ONLY the corrected top-level functions/"
-    "classes (complete definitions); functions that are already correct may be omitted. If two tests demand "
-    f"contradictory results for the same input, reply {UNSOLVABLE} and no code."
+    "You fix bugs in Python source files so that the project's tests pass. The grader runs HIDDEN tests that are "
+    "broader than the visible ones (empty inputs, single elements, negatives, duplicates, mixed case, boundaries), "
+    "so review EVERY function/method, not only the failing ones, and make each behave as its name and docstring "
+    "imply. Never touch the tests. Reply with ONE or more ```python blocks containing ONLY corrected top-level "
+    "functions/classes (complete definitions; a changed method means the whole class). When there are several "
+    "source files, start each block with a comment line '# file: <path>'. Already-correct code may be omitted. "
+    f"No prose, no shell commands. If two tests demand contradictory results for the same input, reply {UNSOLVABLE}."
 )
 
 
-def test_command(test_file: Path) -> list[str]:
+def is_test_file(p: Path) -> bool:
+    return p.suffix == ".py" and (p.name.startswith("test") or p.stem.endswith("_test") or p.stem.endswith("_tests")
+                                  or "tests" in p.parts or "test" in p.parts)
+
+
+def test_command_from_instruction(instr: str, ws: Path) -> list[str] | None:
+    """If the task names the test command (`python3 test_x.py`, `python -m pytest tests/`, `pytest -q`), use it."""
+    for cmd in re.findall(r"`([^`\n]{3,120})`", instr):
+        parts = shlex.split(cmd)
+        if not parts:
+            continue
+        if parts[0] in ("python", "python3", "py"):
+            parts[0] = sys.executable
+        elif parts[0] == "pytest":
+            parts = [sys.executable, "-m", "pytest"] + parts[1:]
+        else:
+            continue
+        if any(a.endswith(".py") or a in ("pytest", "unittest") or a.startswith("tests") for a in parts[1:]):
+            return parts
+    return None
+
+
+def test_command(test_file: Path, ws: Path) -> list[str]:
     """unittest files run as scripts; pytest-style files (bare test_ functions) need a runner, otherwise
     `python test_x.py` exits 0 without running anything and a broken module would look fixed."""
+    rel = str(test_file.relative_to(ws))
     src = read(test_file, 50_000)
-    if "unittest" in src and "unittest.main" in src:
-        return [sys.executable, test_file.name]
+    if "unittest" in src and "unittest.main" in src and test_file.parent == ws:
+        return [sys.executable, rel]
     if "unittest" in src:
-        return [sys.executable, "-m", "unittest", "-q", test_file.stem]
-    return [sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", test_file.name]
+        return [sys.executable, "-m", "unittest", "-q", rel]
+    return [sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", rel]
 
 
-def run_tests(task: Task, test_file: Path) -> tuple[bool, str]:
+def run_tests(task: Task, cmd: list[str]) -> tuple[bool, str]:
     try:
-        p = subprocess.run(test_command(test_file), cwd=task.ws, capture_output=True, text=True, timeout=120)
+        p = subprocess.run(cmd, cwd=task.ws, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
         return False, "tests timed out after 120s"
+    except OSError as e:
+        return False, f"cannot run tests: {e}"
     out = (p.stdout + p.stderr)
     if p.returncode == 5:  # pytest: no tests collected
         return False, out[-3000:] + "\n(no tests were collected)"
@@ -528,90 +610,133 @@ def splice(source: str, patch: str) -> str:
     return out
 
 
+def split_patch(reply: str, srcs: list[Path], ws: Path) -> dict[Path, str]:
+    """Map code blocks to source files: by '# file:' header, else by which file defines the patched names."""
+    blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", reply, re.S) or [extract_code(reply)]
+    by_name = {}
+    for p in srcs:
+        try:
+            for n in ast.parse(read(p)).body:
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    by_name.setdefault(n.name, p)
+        except SyntaxError:
+            pass
+    out: dict[Path, list[str]] = {}
+    for b in blocks:
+        m = re.match(r"\s*#\s*file:\s*(\S+)", b)
+        target = None
+        if m:
+            rel = m.group(1).strip("`'\"")
+            target = next((p for p in srcs if str(p.relative_to(ws)) == rel or p.name == Path(rel).name), None)
+            b = b[m.end():]
+        if target is None:
+            try:
+                names = [n.name for n in ast.parse(b).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+            except SyntaxError:
+                names = []
+            owners = collections.Counter(by_name[n] for n in names if n in by_name)
+            target = owners.most_common(1)[0][0] if owners else srcs[0]
+        out.setdefault(target, []).append(b)
+    return {p: "\n\n".join(bs) for p, bs in out.items()}
+
+
 async def solve_coding(task: Task, llm: LLM, models=None) -> str | None:
     models = models or (FAST, STRONG)
-    tests = [p for p in ws_files(task.ws) if p.suffix == ".py" and (p.name.startswith("test") or p.stem.endswith("_test"))]
-    srcs = [p for p in ws_files(task.ws) if p.suffix == ".py" and p not in tests]
+    pys = [p for p in ws_files(task.ws) if p.suffix == ".py"]
+    tests = [p for p in pys if is_test_file(p)]
+    srcs = [p for p in pys if p not in tests and p.name != "conftest.py" and p.stat().st_size > 0]
     if not tests or not srcs:
         return None
-    test_file = tests[0]
-    m = re.search(r"Fix the bugs in (\S+\.py)", task.instruction)
-    target = next((p for p in srcs if m and p.name == m.group(1)), srcs[0])
+    m = re.search(r"\b(?:in|fix|repair)\s+(\S+\.py)", task.instruction, re.I)
+    named = [p for p in srcs if m and p.name == m.group(1)]
+    srcs = named + [p for p in srcs if p not in named]
+    cmd = test_command_from_instruction(task.instruction, task.ws) or test_command(tests[0], task.ws)
     test_backup = {p: p.read_bytes() for p in tests}
-    original = read(target)
+    originals = {p: read(p) for p in srcs}
 
-    ok, out = run_tests(task, test_file)
+    ok, out = run_tests(task, cmd)
     if ok:
         return "DONE"
     instr = strip_boilerplate(task.instruction)
-    user = (f"Task: {instr}\n\n### {target.name}\n```python\n{original}\n```\n\n"
-            + "".join(f"### {t.name}\n```python\n{read(t)}\n```\n\n" for t in tests)
-            + f"### test output\n```\n{out[-2500:]}\n```\n\n"
+    shown_src = "".join(f"### {p.relative_to(task.ws)}\n```python\n{originals[p]}\n```\n\n" for p in srcs)[:14000]
+    shown_tests = "".join(f"### {t.relative_to(task.ws)}\n```python\n{read(t, 6000)}\n```\n\n" for t in tests)[:10000]
+    user = (f"Task: {instr}\n\n{shown_src}{shown_tests}### test output of `{' '.join(cmd[1:] if cmd[0] == sys.executable else cmd)}`\n```\n{out[-2500:]}\n```\n\n"
             "Note: a function whose visible test passes can still be wrong (e.g. the test input happens to "
             "work). Check each function's logic against its name and include a fixed version of every "
             "function that is incorrect.")
     msgs = [{"role": "system", "content": SYS_CODE}, {"role": "user", "content": user}]
-    for attempt, model in enumerate(models):
+    attempts = list(models) + [models[0]]  # one extra attempt for a prose-only / unparsable reply
+    for attempt, model in enumerate(attempts[:3]):
         reply = await llm.ask(msgs, model=model, max_tokens=1500 if "noreason" in model else 3000,
                               tag=f"{task.id}#{attempt}")
         if is_unsolvable(reply) and "```" not in reply:
-            task.trace.append({"reply": reply})
+            task.trace.append({"reply": reply[:300]})
             break
-        patch = extract_code(reply)
+        if "```" not in reply and "def " not in reply:
+            task.trace.append({"reply": reply[:300]})
+            msgs += [{"role": "assistant", "content": reply},
+                     {"role": "user", "content": "You cannot explore or run commands. Reply now with the corrected code only, in ```python blocks."}]
+            continue
+        patches = split_patch(reply, srcs, task.ws)
         try:
-            target.write_text(splice(read(target), patch))
+            for p, patch in patches.items():
+                p.write_text(splice(read(p), patch))
         except SyntaxError as e:
             out = f"Your code has a syntax error: {e}"
+            ok = False
         else:
             for p, b in test_backup.items():
                 p.write_bytes(b)
-            ok, out = run_tests(task, test_file)
-        task.trace.append({"patch": patch, "ok": ok, "out": out[-800:]})
+            ok, out = run_tests(task, cmd)
+        task.trace.append({"patch": reply[:2000], "files": [str(p.relative_to(task.ws)) for p in patches], "ok": ok, "out": out[-800:]})
         if ok:
             return "DONE"
         msgs += [{"role": "assistant", "content": reply},
-                 {"role": "user", "content": f"Tests still fail:\n```\n{out[-2000:]}\n```\nReply with the corrected functions again."}]
-    target.write_text(original)
+                 {"role": "user", "content": f"Tests still fail:\n```\n{out[-2000:]}\n```\nReply with the corrected code again."}]
+    for p, src in originals.items():
+        p.write_text(src)
     return None
 
 
 SYS_KB = (
-    "You answer a question about a small knowledge base of text files by writing a SHORT Python 3 snippet "
-    "(at most ~15 lines). These variables are already defined for you, do not redefine them:\n"
-    "  kb: dict[path -> file text] for every file under the current directory;\n"
-    "  records: dict[title -> {field_lower: value}] parsed from '# Title' headings and 'Key: Value' lines "
-    "(fields are lower-case keys, e.g. records['Alice Smith']['employer']); '_file' holds the path;\n"
-    "  rec(name) -> that record by title (case-insensitive exact match) or None.\n"
-    "Follow references between records when needed (person -> mentor/employer -> company). Match names "
-    "exactly; a similar name is a different entity. Use field names exactly as they appear in the sample "
-    "files (lower-cased). Print ONLY the final answer on the last line (bare "
-    f"year, city, name or number). If an entity, file or field needed for the answer is absent, print {UNSOLVABLE} "
-    "instead of guessing; answer only the field asked for (a birth city is not a birth year). Do not hard-code "
-    "the answer. Reply format: one line 'CHECK: <entities/fields needed, present or not>' then one ```python "
-    "block with short code, no comments."
+    "You answer a question about a small knowledge base of files by writing a SHORT Python 3 snippet (<= ~15 "
+    "lines). Predefined variables (do not redefine, do not write files):\n"
+    "  kb: dict path -> full text of every file under the current directory;\n"
+    "  records: dict title -> {field: value} parsed from headings/sections, 'Key: value' lines and JSON objects; "
+    "every record also has '_file' and '_text' (its raw text);\n"
+    "  rec(name): record by title (case-insensitive exact match), else the unique record whose text starts with or "
+    "mentions the name; None if absent;\n"
+    "  grep(regex): [(path, line)] over all files, case-insensitive; facts(name): sentences mentioning a name.\n"
+    "When extracting a value from a sentence, capture lazily up to a delimiter, e.g. r'works at (.+?)(?= as | and |[.,;])'.\n"
+    "Follow references between records when needed (person -> mentor/employer -> organisation). Match names "
+    "exactly; a similar name is a different entity. Use only field names that the summary/sample show exist; "
+    "for free-text notes extract values with regular expressions. Print ONLY the final answer on the last line "
+    f"(bare year, city, name or number). If the entity or the specific fact asked for is absent, print {UNSOLVABLE} "
+    "instead of guessing or printing a related value. Reply format: one line 'CHECK: <what is needed>' then one "
+    "```python block, short code, no comments."
 )
 
 
-def kb_preview(ws: Path, question: str, limit: int = 2500) -> str:
+def kb_preview(ws: Path, question: str, limit: int = 2600) -> str:
     files = ws_files(ws)
     words = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", question)}
-    names = sorted({re.split(r"[_\-.]", p.name)[0] for p in files})
     picked, seen = [], set()
-    for p in files:  # one sample per filename prefix (person_, company_, ...) so every record shape is shown
-        pre = re.split(r"[_\-.]", p.name)[0]
-        if pre not in seen:
-            seen.add(pre); picked.append(p)
+    for p in files:  # one sample per (directory, filename prefix) so every record shape is shown
+        key = (p.parent, re.split(r"[_\-.]", p.name)[0])
+        if key not in seen:
+            seen.add(key); picked.append(p)
     for p in files:  # then files named after entities in the question
-        if any(w in p.name.lower() for w in words) and p not in picked:
+        if any(w in str(p.relative_to(ws)).lower() for w in words) and p not in picked:
             picked.append(p)
     parts, used = [], 0
     for p in picked[:5]:
-        chunk = f"### {p.relative_to(ws)}\n{read(p, 800).strip()}"
+        chunk = f"### {p.relative_to(ws)}\n{read(p, 700).strip()}"
         if used + len(chunk) > limit:
             break
         parts.append(chunk); used += len(chunk)
-    return (f"{len(files)} files; filename prefixes: {', '.join(names[:12])}; e.g. "
-            f"{', '.join(str(p.relative_to(ws)) for p in files[:3])}\n\nSample files:\n" + "\n\n".join(parts))
+    dirs = sorted({str(p.parent.relative_to(ws)) for p in files})[:8]
+    return (f"{len(files)} files in {dirs}; e.g. {', '.join(str(p.relative_to(ws)) for p in files[:3])}\n"
+            f"Parsed summary: {kb_summary(ws)}\n\nSample file contents (truncated):\n" + "\n\n".join(parts))
 
 
 async def solve_search_code(task: Task, llm: LLM, models=None) -> str | None:
@@ -620,12 +745,11 @@ async def solve_search_code(task: Task, llm: LLM, models=None) -> str | None:
     instr = re.sub(r"\s*Use the file tools.*?\.\s*", " ", instr).strip()
     user = f"Question: {instr}\n\n{kb_preview(task.ws, instr)}"
     msgs = [{"role": "system", "content": SYS_KB}, {"role": "user", "content": user}]
-    max_tokens = 400
+    max_tokens = 450
     for attempt, model in enumerate(models):
         reply, truncated = await llm.ask(msgs, model=model, tag=f"{task.id}#{attempt}", want_truncated=True,
                                          max_tokens=max_tokens if "noreason" in model else 2500)
-        # for KB tasks the CHECK line is written before looking at the data ("birth year: unknown"), so it is
-        # not a verdict; the code decides and prints UNSOLVABLE when a record or field is really absent
+        # the CHECK line is written before looking at the data, so it is not a verdict here: the code decides
         code = extract_code(reply)
         rc, out, err = run_python(code, task.ws, prelude=KB_PRELUDE)
         ans = clean_answer(out).strip(" .`*\"'")
@@ -635,7 +759,7 @@ async def solve_search_code(task: Task, llm: LLM, models=None) -> str | None:
         if truncated:
             max_tokens = 900
             msgs += [{"role": "assistant", "content": reply},
-                     {"role": "user", "content": "Your reply was cut off. Rewrite it much shorter (use records/rec()). One ```python block."}]
+                     {"role": "user", "content": "Your reply was cut off. Rewrite it much shorter (use records/rec()/grep()). One ```python block."}]
         else:
             msgs += [{"role": "assistant", "content": reply},
                      {"role": "user", "content": f"The program failed (exit {rc}).\nstdout:\n{out[-600:]}\nstderr:\n{err[-1000:]}\nFix it. One ```python block."}]
