@@ -1,0 +1,8 @@
+.venv
+runs
+tg
+logs
+.env
+tasks
+*.session
+__pycache__

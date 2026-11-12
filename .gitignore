@@ -1,0 +1,8 @@
+.env
+tg/
+__pycache__/
+.DS_Store
+runs/
+.venv/
+gen/
+tg_read.py
