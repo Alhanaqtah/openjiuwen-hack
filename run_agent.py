@@ -23,6 +23,25 @@ _WORKDIR = Path(os.environ.get("HARNESS_WORKDIR", Path(tempfile.gettempdir()) / 
 _WORKDIR.mkdir(parents=True, exist_ok=True)
 os.chdir(_WORKDIR)
 
+def _quiet_openjiuwen_logs():
+    """openJiuwen echoes every LLM request/response to stdout; keep its logs in files only, warnings and up."""
+    try:
+        from openjiuwen.core.common.logging.log_config import log_config
+        from openjiuwen.core.common.logging.manager import LogManager
+        cfg = log_config.get_snapshot()
+        cfg["level"] = "WARNING"
+        cfg["propagate"] = False
+        for k in list(cfg):
+            if k == "output" or k.endswith("_output"):
+                cfg[k] = ["file"]
+        log_config.load_from_dict(cfg)
+        LogManager.reset()
+    except Exception as e:  # logging must never break the run
+        print("openjiuwen log config not adjusted:", e)
+
+
+_quiet_openjiuwen_logs()
+
 from openjiuwen.core.foundation.llm.model import Model  # noqa: E402
 from openjiuwen.core.foundation.llm.schema.config import ModelClientConfig, ModelRequestConfig  # noqa: E402
 
@@ -32,7 +51,7 @@ FAST = os.environ.get("MODEL_FAST", "qwen3.8-27b-noreason")      # primary model
 STRONG = os.environ.get("MODEL_STRONG", "qwen3.6-35b-a3b-noreason")  # second opinion / retry
 REASON = os.environ.get("MODEL_REASON", "qwen3.8-27b")  # tie-breaker only (reasoning tokens are expensive)
 VERIFY = os.environ.get("VERIFY", "1") == "1"  # phase 2: second opinion on answered tasks while budget remains
-VERIFY_KEEP = float(os.environ.get("VERIFY_KEEP", "0.35"))  # share of budget never spent on verification
+VERIFY_KEEP = float(os.environ.get("VERIFY_KEEP", "0.5"))  # share of budget never spent on verification
 PRECHECK = os.environ.get("PRECHECK", "0") == "1"  # gate every compute task (hurts recall; off)
 ZERO_GUARD = os.environ.get("ZERO_GUARD", "1") == "1"  # re-check tasks whose computed answer is 0
 PARALLEL = int(os.environ.get("PARALLEL", "4"))
@@ -464,13 +483,25 @@ SYS_CODE = (
 )
 
 
+def test_command(test_file: Path) -> list[str]:
+    """unittest files run as scripts; pytest-style files (bare test_ functions) need a runner, otherwise
+    `python test_x.py` exits 0 without running anything and a broken module would look fixed."""
+    src = read(test_file, 50_000)
+    if "unittest" in src and "unittest.main" in src:
+        return [sys.executable, test_file.name]
+    if "unittest" in src:
+        return [sys.executable, "-m", "unittest", "-q", test_file.stem]
+    return [sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", test_file.name]
+
+
 def run_tests(task: Task, test_file: Path) -> tuple[bool, str]:
     try:
-        p = subprocess.run([sys.executable, test_file.name], cwd=task.ws, capture_output=True,
-                           text=True, timeout=120)
+        p = subprocess.run(test_command(test_file), cwd=task.ws, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
         return False, "tests timed out after 120s"
     out = (p.stdout + p.stderr)
+    if p.returncode == 5:  # pytest: no tests collected
+        return False, out[-3000:] + "\n(no tests were collected)"
     return p.returncode == 0, out[-3000:]
 
 
@@ -499,7 +530,7 @@ def splice(source: str, patch: str) -> str:
 
 async def solve_coding(task: Task, llm: LLM, models=None) -> str | None:
     models = models or (FAST, STRONG)
-    tests = [p for p in ws_files(task.ws) if p.name.startswith("test") and p.suffix == ".py"]
+    tests = [p for p in ws_files(task.ws) if p.suffix == ".py" and (p.name.startswith("test") or p.stem.endswith("_test"))]
     srcs = [p for p in ws_files(task.ws) if p.suffix == ".py" and p not in tests]
     if not tests or not srcs:
         return None
@@ -593,9 +624,8 @@ async def solve_search_code(task: Task, llm: LLM, models=None) -> str | None:
     for attempt, model in enumerate(models):
         reply, truncated = await llm.ask(msgs, model=model, tag=f"{task.id}#{attempt}", want_truncated=True,
                                          max_tokens=max_tokens if "noreason" in model else 2500)
-        if check_line_says_unsolvable(reply) and not truncated:
-            task.trace.append({"check": reply[:300]})
-            return None
+        # for KB tasks the CHECK line is written before looking at the data ("birth year: unknown"), so it is
+        # not a verdict; the code decides and prints UNSOLVABLE when a record or field is really absent
         code = extract_code(reply)
         rc, out, err = run_python(code, task.ws, prelude=KB_PRELUDE)
         ans = clean_answer(out).strip(" .`*\"'")
@@ -758,7 +788,7 @@ def main():
     a.tasks_dir = os.path.join(_LAUNCH_DIR, a.tasks_dir)
     a.traces = a.traces and os.path.join(_LAUNCH_DIR, a.traces)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stdout)
-    for noisy in ("httpx", "openjiuwen", "openai", "common"):
+    for noisy in ("httpx", "openjiuwen", "openai", "common", "alembic", "llm"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.getLogger("llm").setLevel(logging.CRITICAL)  # openJiuwen echoes whole prompts on every error
 

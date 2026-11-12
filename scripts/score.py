@@ -33,13 +33,18 @@ for d in sorted(root.iterdir()):
         ws = d / "workspace"
         hidden = d / "hidden_tests.py"
         tests = next(ws.glob("test*.py"))
+        def cmd(tf):
+            src = tf.read_text()
+            if "unittest.main" in src:
+                return [sys.executable, tf.name]
+            return [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", tf.name]
         if hidden.exists():
             with tempfile.TemporaryDirectory() as tmp:
                 shutil.copytree(ws, Path(tmp) / "ws")
                 shutil.copy(hidden, Path(tmp) / "ws" / "hidden_tests.py")
-                rc = subprocess.run([sys.executable, "hidden_tests.py"], cwd=Path(tmp) / "ws", capture_output=True).returncode
+                rc = subprocess.run(cmd(Path(tmp) / "ws" / "hidden_tests.py"), cwd=Path(tmp) / "ws", capture_output=True).returncode
         else:
-            rc = subprocess.run([sys.executable, tests.name], cwd=ws, capture_output=True).returncode
+            rc = subprocess.run(cmd(tests), cwd=ws, capture_output=True).returncode
         ok = ans == "DONE" and rc == 0
     elif chk == "exact_int":
         ok = ans.replace(",", "") == str(exp)
